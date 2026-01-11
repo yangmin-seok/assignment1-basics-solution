@@ -212,7 +212,7 @@ class Tokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str]):
         self.vocab = vocab
         self.merges = merges
-        self.special_tokens = special_tokens
+        self.special_tokens = special_tokens if special_tokens is not None else []
 
         # vocab: id -> bytes
         # Create reverse mapping for encoding
@@ -336,34 +336,74 @@ class Tokenizer:
         byte_sequence = b"".join(self.vocab[id] for id in ids)
         return byte_sequence.decode("utf-8", errors="replace")
 
-# Example usage and testing
-if __name__ == "__main__":
-    # Test with a small corpus
-    test_corpus = "Hello world! This is a test corpus for BPE training."
+# # Example usage and testing
+# if __name__ == "__main__":
+#     # Test with a small corpus
+#     test_corpus = "Hello world! This is a test corpus for BPE training."
     
-    # Write to temporary file
-    test_file = "tests/fixtures/tinystories_sample.txt"
+#     # Write to temporary file
+#     test_file = "tests/fixtures/tinystories_sample.txt"
     
-    # Train BPE
-    vocab, merges = train_bpe(
-        input_path=test_file,
-        vocab_size=10000,  # 1 special + 256 bytes + 43 merges
-        special_tokens=["<|endoftext|>"]
-    )
+#     # Train BPE
+#     vocab, merges = train_bpe(
+#         input_path=test_file,
+#         vocab_size=10000,  # 1 special + 256 bytes + 43 merges
+#         special_tokens=["<|endoftext|>"]
+#     )
     
-    print(f"\nVocabulary size: {len(vocab)}")
-    print(f"Number of merges: {len(merges)}")
+#     print(f"\nVocabulary size: {len(vocab)}")
+#     print(f"Number of merges: {len(merges)}")
     
-    # Show first few merges
-    print(f"\nFirst 10 merges:")
-    for i, (b1, b2) in enumerate(merges[:100]):
-        try:
-            char1 = b1.decode('utf-8', errors='replace')
-            char2 = b2.decode('utf-8', errors='replace')
-            print(f"  {i+1:2d}. ({b1}, {b2}) -> '{char1}' + '{char2}'")
-        except:
-            print(f"  {i+1:2d}. {(b1, b2)}")
+#     # Show first few merges
+#     print(f"\nFirst 10 merges:")
+#     for i, (b1, b2) in enumerate(merges[:100]):
+#         try:
+#             char1 = b1.decode('utf-8', errors='replace')
+#             char2 = b2.decode('utf-8', errors='replace')
+#             print(f"  {i+1:2d}. ({b1}, {b2}) -> '{char1}' + '{char2}'")
+#         except:
+#             print(f"  {i+1:2d}. {(b1, b2)}")
 
-    # Create tokenizer instance
-    tokenizer = Tokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
-    print(tokenizer.encode("Hello world! This is a test corpus for BPE training. <|endoftext|> Today is a good day."))
+#     # Create tokenizer instance
+#     tokenizer = Tokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
+#     print(tokenizer.encode("Hello world! This is a test corpus for BPE training. <|endoftext|> Today is a good day."))
+
+if __name__ == "__main__":
+    import tempfile
+    
+    # 1. 임시 학습 데이터 생성
+    test_text = "hello hello world world world"
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as f:
+        f.write(test_text)
+        temp_path = f.name
+
+    try:
+        # 2. BPE 학습
+        # vocab_size를 작게 잡아서 병합이 일어나는지 확인 (256바이트 + 1스페셜 + 알파)
+        vocab, merges = train_bpe(
+            input_path=temp_path,
+            vocab_size=265, 
+            special_tokens=["<|endoftext|>"]
+        )
+        
+        print(f"학습 완료! Vocab 크기: {len(vocab)}")
+        print(f"병합 규칙 개수: {len(merges)}")
+        for i, m in enumerate(merges):
+            print(f"Merge {i+1}: {m[0]} + {m[1]} -> {m[0]+m[1]}")
+
+        # 3. 토크나이저 생성 및 인코딩 테스트
+        tokenizer = Tokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
+        test_sentence = "hello world <|endoftext|>"
+        encoded = tokenizer.encode(test_sentence)
+        decoded = tokenizer.decode(encoded)
+
+        print(f"\n입력 문장: {test_sentence}")
+        print(f"인코딩 결과: {encoded}")
+        print(f"디코딩 결과: {decoded}")
+        
+        assert test_sentence == decoded, "Roundtrip 실패!"
+        print("\n✅ 테스트 성공: 인코딩 후 디코딩했을 때 원문과 일치합니다.")
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None # Windows에서는 None이 됨
 import sys
 
 import psutil
@@ -19,6 +22,10 @@ MERGES_PATH = FIXTURES_PATH / "gpt2_merges.txt"
 def memory_limit(max_mem):
     def decorator(f):
         def wrapper(*args, **kwargs):
+            # resource 모듈이 없는 경우(Windows) 제한 없이 함수 실행
+            if resource is None:
+                return f(*args, **kwargs)
+            
             process = psutil.Process(os.getpid())
             prev_limits = resource.getrlimit(resource.RLIMIT_AS)
             resource.setrlimit(resource.RLIMIT_AS, (process.memory_info().rss + max_mem, -1))
