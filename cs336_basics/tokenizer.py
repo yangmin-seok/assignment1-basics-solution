@@ -4,6 +4,7 @@ import os
 from typing import BinaryIO
 import regex as re
 from collections import defaultdict
+from typing import Iterable
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -207,6 +208,133 @@ def find_chunk_boundaries(
 
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str]):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+
+        # vocab: id -> bytes
+        # Create reverse mapping for encoding
+        self.bytes_to_id = {bytes: id for id, bytes in vocab.items()} # encoding 시에 사용
+
+        if special_tokens:
+            sorted_tokens = sorted(special_tokens, key=len, reverse=True) # 길이가 긴 순서대로 정렬
+            escape_tokens = [re.escape(token) for token in sorted_tokens] # 각 special token을 문자열로 취급, '|'가 포함될 수 있기 때문에 escape를 사용해서 하나의 문자열로 취급해줘야함
+            self.special_token_pattern = "(" + "|".join(escape_tokens) + ")"# 괄호를 사용해서 special token도 살리기
+        else:
+            self.special_token_pattern = None
+
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] = None):
+        """
+        Create a tokenizer from saved vocabulary and merges files.
+        
+        Args:
+            vocab_filepath: Path to the pickled vocabulary file
+            merges_filepath: Path to the pickled merges file  
+            special_tokens: Optional list of special tokens
+            
+        Returns:
+            Tokenizer instance
+        """
+        import pickle
+        
+        with open(vocab_filepath, 'rb') as f:
+            vocab = pickle.load(f)
+            
+        with open(merges_filepath, 'rb') as f:
+            merges = pickle.load(f)
+            
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        if not text:
+            return []
+                
+        # 1. Special Token 분할
+        if self.special_token_pattern:
+            segments = re.split(self.special_token_pattern, text)
+        else:
+            segments = [text]
+        
+        token_ids: list[int] = []
+        
+        for segment in segments:
+            if not segment:
+                continue
+            
+            # Special Token 처리
+            if segment in self.special_tokens:
+                segment_bytes = segment.encode("utf-8")
+                if segment_bytes in self.bytes_to_id:
+                    token_ids.append(self.bytes_to_id[segment_bytes])
+                continue
+
+            # 일반 텍스트 처리 (Pre-tokenization)
+            for match in re.finditer(PAT, segment):
+                word = match.group(0)
+                # 초기 단위: 개별 바이트를 튜플로 감쌈
+                token_bytes = tuple(bytes([b]) for b in word.encode("utf-8"))
+                #print("token_bytes 초기 상태:", [t.decode('utf-8', errors='replace') for t in token_bytes])
+                
+                while len(token_bytes) > 1:
+                    # 현재 상태에서 가능한 모든 인접 쌍(pair) 생성
+                    pairs = []
+                    for i in range(len(token_bytes) - 1):
+                        pairs.append((token_bytes[i], token_bytes[i+1]))
+
+                    best_pair = None
+                    # 리스트라고 가정할 때 가장 작은 index가 우선순위가 높음
+                    best_merge_idx = float('inf')
+                
+                    for pair in pairs:
+                        if pair in self.merges:
+                            # 자료구조 무시: 리스트의 index 추출 시나리오
+                            current_idx = self.merges.index(pair) 
+                            if current_idx < best_merge_idx:
+                                best_merge_idx = current_idx
+                                best_pair = pair
+
+                    # 더 이상 병합할 규칙이 없으면 종료
+                    if best_pair is None:
+                        break
+
+                    # 병합 수행 (문장 내의 모든 best_pair를 하나로 합침)
+                    p1, p2 = best_pair
+                    new_tokens = []
+                    i = 0
+                    while i < len(token_bytes):
+                        if i < len(token_bytes) - 1 and (token_bytes[i], token_bytes[i+1]) == (p1, p2):
+                            new_tokens.append(p1 + p2)
+                            i += 2
+                        else:
+                            new_tokens.append(token_bytes[i])
+                            i += 1
+                    
+                    token_bytes = tuple(new_tokens)
+                    
+                # 최종적으로 만들어진 토큰들을 ID로 변환
+                for token in token_bytes:
+                    if token in self.bytes_to_id:
+                        token_ids.append(self.bytes_to_id[token])
+                    else:
+                        print(f"  [경고] Vocab에 없는 토큰 발견: {token}")
+                        # 개별 바이트로 쪼개서라도 추가
+                        for b in token:
+                            token_ids.append(self.bytes_to_id[bytes([b])])
+
+        return token_ids
+    
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+        # Iterable한 문자열을 받아서 각 문자열을 인코딩한 토큰 ID를 순차적으로 반환
+        for text in iterable:
+            for token_id in self.encode(text):
+                yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode a sequence of token IDs into text"""
+        byte_sequence = b"".join(self.vocab[id] for id in ids)
+        return byte_sequence.decode("utf-8", errors="replace")
 
 # Example usage and testing
 if __name__ == "__main__":
@@ -219,7 +347,7 @@ if __name__ == "__main__":
     # Train BPE
     vocab, merges = train_bpe(
         input_path=test_file,
-        vocab_size=400,  # 1 special + 256 bytes + 43 merges
+        vocab_size=10000,  # 1 special + 256 bytes + 43 merges
         special_tokens=["<|endoftext|>"]
     )
     
@@ -235,3 +363,7 @@ if __name__ == "__main__":
             print(f"  {i+1:2d}. ({b1}, {b2}) -> '{char1}' + '{char2}'")
         except:
             print(f"  {i+1:2d}. {(b1, b2)}")
+
+    # Create tokenizer instance
+    tokenizer = Tokenizer(vocab, merges, special_tokens=["<|endoftext|>"])
+    print(tokenizer.encode("Hello world! This is a test corpus for BPE training. <|endoftext|> Today is a good day."))
