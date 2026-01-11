@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import BinaryIO
 import regex as re
+from collections import defaultdict
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -81,50 +82,81 @@ def train_bpe(
                     token_bytes = tuple(bytes([b]) for b in match.group(0).encode("utf-8"))
                     freq_table[token_bytes] = freq_table.get(token_bytes, 0) + 1 # get으로 기본값 0 설정 후 빈도수 추가
 
-        # vocab_size까지 도달할 때까지 byte pair merge 수행
-        # 합친 두 byte를 새로운 byte로 취급하여 freq_table을 수정
+        # initialize byte pair counts
+        # 각 단어의 byte pair 빈도 수 계산
+        # 예: b'abc'라면 (b'a', b'b'), (b'b', b'c') 쌍이 각각 1회 등장
+        # pair가 포함된 단어들도 추적    
 
-        while len(vocab) < vocab_size:
-            adjacent_byte_pair_freq: dict[tuple[bytes, bytes], int] = {} # 인접하는 byte pair의 빈도 수 테이블
+    pair_counts: dict[tuple[bytes, bytes], int] = defaultdict(int)
+    pair_to_words: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = defaultdict(set)
+
+    for word, freq in freq_table.items():
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i+1])
+            pair_counts[pair] = pair_counts.get(pair, 0) + freq
+            pair_to_words[pair].add(word)
+
+    # 4. 반복적인 병합 수행
+    while len(vocab) < vocab_size:
+        if not pair_counts:
+            break
+
+        # 빈도가 높고 사전순으로 큰 쌍 선택 (Tie-breaking rule) 
+        max_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        if pair_counts[max_pair] <= 0:
+            break
             
-            # 빈도수 table을 순회하면서 인접한 byte pair의 빈도 수 계산
-            for token_bytes, freq in freq_table.items():
-                # 길이가 1이면 pass
-                if len(token_bytes) < 2:
-                    continue
-                # 인접한 byte pair 추출
-                # token_bytes가 b'abc'라면 (b'a', b'b'), (b'b', b'c') 추출
-                for i in range(len(token_bytes) - 1):
-                    byte_pair = (token_bytes[i], token_bytes[i + 1])
-                    adjacent_byte_pair_freq[byte_pair] = adjacent_byte_pair_freq.get(byte_pair, 0) + freq
+        merges.append(max_pair)
+        new_token = max_pair[0] + max_pair[1]
+        vocab[vocab_idx] = new_token
+        vocab_idx += 1
 
-            # count가 높고 사전순으로 뒤에 오는 쌍 추출
-            max_pair, _ = max(adjacent_byte_pair_freq.items(), key=lambda x: (x[1], x[0])) 
+        # 영향을 받는 단어들만 핀셋 업데이트
+        # max_pair를 가지고 있는 단어 리스트를 복사하여 순회
+        target_words = list(pair_to_words[max_pair])
+        for old_word in target_words:
+            count = freq_table[old_word]
             
-            # update merge table 
-            merges.append(max_pair) # (b'a', b'b') 형태로 저장
+            # (1) 기존 단어에서 모든 인접 쌍의 빈도 제거
+            for i in range(len(old_word) - 1):
+                p = (old_word[i], old_word[i+1])
+                pair_counts[p] -= count
+                pair_to_words[p].discard(old_word)
 
-            # update vocab table
-            vocab[vocab_idx] = max_pair[0] + max_pair[1] # 새로운 byte 추가, ex) [256] = b'ab'
-            vocab_idx += 1
+            # (2) 실제 병합 수행 
+            new_word = []
+            i = 0
+            while i < len(old_word):
+                if i < len(old_word) - 1 and (old_word[i], old_word[i+1]) == max_pair:
+                    new_word.append(new_token)
+                    i += 2
+                else:
+                    new_word.append(old_word[i])
+                    i += 1
+            new_word = tuple(new_word)
+            
+            # (3) 새로운 단어로 데이터 구조 갱신
+            freq_table.pop(old_word)
+            freq_table[new_word] = freq_table.get(new_word, 0) + count
+            
+            # 새로운 인접 쌍들의 빈도 추가 및 인덱싱
+            for i in range(len(new_word) - 1):
+                p = (new_word[i], new_word[i+1])
+                pair_counts[p] = pair_counts.get(p, 0) + count
+                pair_to_words[p].add(new_word)
 
-            # freq_table을 순회하면서 max_pair를 합친 새로운 token tuple로 갱신
-            new_freq_table: dict[tuple[bytes], int] = {}
-            for token_tuple, freq in freq_table.items():
-                new_token_tuple = []
-                i = 0
-                while i < len(token_tuple):
-                    if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i+1]) == max_pair:
-                        new_token_tuple.append(max_pair[0] + max_pair[1]) # (b'a', b'b') -> b'ab' 형태로 추가
-                        i += 2
-                    else:
-                        new_token_tuple.append(token_tuple[i])
-                        i += 1
-                new_freq_table[tuple(new_token_tuple)] = freq
+        # 빈도가 0이 된 쌍은 관리 대상에서 제거
+        # dictionary 크기를 줄여 max() 연산 속도 유지
+        pair_counts = {k: v for k, v in pair_counts.items() if v > 0}
 
-            freq_table = new_freq_table
-    
+        # 횟수 debug 출력
+        if len(merges) % 100 == 0:
+            print(f"Merges done: {len(merges)}, Vocab size: {len(vocab)}")
+
     return vocab, merges
+
+
 
 def find_chunk_boundaries(
     file: BinaryIO,
