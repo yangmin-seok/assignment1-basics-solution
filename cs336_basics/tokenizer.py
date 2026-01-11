@@ -1,13 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
-
-import numpy.typing as npt
-import torch
-from jaxtyping import Bool, Float, Int
-from torch import Tensor
+from typing import BinaryIO
 import regex as re
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -18,17 +12,44 @@ def train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # return
+    """Given the path to an input corpus, run train a BPE tokenizer and
+    output its vocabulary and merges.
+
+    Args:
+        input_path (str | os.PathLike): Path to BPE tokenizer training data.
+        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
+        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
+            These strings will never be split into multiple tokens, and will always be
+            kept as a single token. If these special tokens occur in the `input_path`,
+            they are treated as any other string.
+
+    Returns:
+        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+            vocab:
+                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+                to bytes (token bytes)
+            merges:
+                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
+                representing that <token1> was merged with <token2>.
+                Merges are ordered by order of creation.
+    """
+    
+    # Define vocabulary and merges
     vocab: dict[int, bytes] = {} # index to byte sequence
     merges: list[tuple[bytes, bytes]] = [] # list of byte pair merges, 만들어진 순서대로 저장, ex) [(b'a', b'b'), (b'ab', b'c')]
     
-    ### Initialize the vocabulary with special tokens ###
-    for i in range(0, 256):
-        vocab[i] = bytes([i]) # [0] = b'\x00', [1] = b'\x01', ..., [255] = b'\xff'
-
+    # Initialize vocabulary with special tokens and all single byte values
+    vocab_idx = 0
     for special_token in special_tokens:
-        vocab[len(vocab)] = special_token.encode("utf-8")
+        vocab[vocab_idx] = special_token.encode("utf-8")
+        vocab_idx += 1
 
+    for i in range(0, 256):
+        # 0부터 255까지 모든 1byte 값 추가. 이때 bytes(i)는 안되고 bytes([i])로 해야됨
+        vocab[vocab_idx] = bytes([i]) # [1] = b'\x00', [2] = b'\x01', ..., [256] = b'\xff'
+        vocab_idx += 1
+
+    # Open the input file 
     with open(input_path, "rb") as f:
         num_processes = 4
 
@@ -38,39 +59,33 @@ def train_bpe(
 
         # frequency table: dict[tuple[bytes], int]
         # 각 단어를 byte로 변환 후, freq_table에 빈도 수 추가
+        # tuple로 관리해야 나중에 합칠 때 편함
         freq_table: dict[tuple[bytes], int] = {}
 
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-
-        # Update: frequency table by reading each chunk
         for start, end in zip(boundaries[:-1], boundaries[1:]):
             f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            chunk = f.read(end - start).decode("utf-8", errors="ignore") # str 형태로 읽기
 
-            # 추가: Windows 줄바꿈을 Unix 스타일로 정규화
+            # Windows 줄바꿈을 Unix 스타일로 정규화: Test 통과를 위해서
             chunk = chunk.replace("\r\n", "\n")
-
-            # Run pre-tokenization on your chunk and store the counts for each pre-token        
+       
             # split on special tokens (e.g <|endoftext|>)
-            escape_tokens = [re.escape(token) for token in special_tokens] # 각 special token을 문자열로 취급
+            escape_tokens = [re.escape(token) for token in special_tokens] # 각 special token을 문자열로 취급, '|'가 포함될 수 있기 때문에 escape를 사용해서 하나의 문자열로 취급해줘야함
             pattern = "|".join(escape_tokens) # speical token을 OR로 찾기
             removed_special_tokens = re.split(pattern, chunk) # speical toeken 기준으로 split
 
             # pre-tokenization pattern using re.finditer
             for segment in removed_special_tokens: # special token 기준으로 나눠진 segment들에 대해
-                for match in re.finditer(PAT, segment): # 단어 별로 분해
-                    # tuple로 1byte씩 쪼개서 저장
-                    # 각각을 bytes로 저장해줘야됨!!
+                for match in re.finditer(PAT, segment): # 단어 별로 분해, 이때 하나씩 읽기
+                    # tuple로 1byte씩 쪼개서 저장. 각각을 bytes로 저장해줘야됨!!
                     token_bytes = tuple(bytes([b]) for b in match.group(0).encode("utf-8"))
-                    freq_table[token_bytes] = freq_table.get(token_bytes, 0) + 1
+                    freq_table[token_bytes] = freq_table.get(token_bytes, 0) + 1 # get으로 기본값 0 설정 후 빈도수 추가
 
         # vocab_size까지 도달할 때까지 byte pair merge 수행
-        # Merge special tokens into the vocabulary with high frequency until the vocab size is under vocab_size
         # 합친 두 byte를 새로운 byte로 취급하여 freq_table을 수정
 
         while len(vocab) < vocab_size:
-            adjacent_byte_pair_freq: dict[tuple[bytes, bytes], int] = {}
+            adjacent_byte_pair_freq: dict[tuple[bytes, bytes], int] = {} # 인접하는 byte pair의 빈도 수 테이블
             
             # 빈도수 table을 순회하면서 인접한 byte pair의 빈도 수 계산
             for token_bytes, freq in freq_table.items():
@@ -90,16 +105,17 @@ def train_bpe(
             merges.append(max_pair) # (b'a', b'b') 형태로 저장
 
             # update vocab table
-            vocab[len(vocab)] = max_pair[0] + max_pair[1] # 새로운 byte 추가, ex) [256] = b'ab'
+            vocab[vocab_idx] = max_pair[0] + max_pair[1] # 새로운 byte 추가, ex) [256] = b'ab'
+            vocab_idx += 1
 
-            # max_pair에 해당하는 byte 쌍을 새로운 쌍으로 치환
+            # freq_table을 순회하면서 max_pair를 합친 새로운 token tuple로 갱신
             new_freq_table: dict[tuple[bytes], int] = {}
             for token_tuple, freq in freq_table.items():
                 new_token_tuple = []
                 i = 0
                 while i < len(token_tuple):
                     if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i+1]) == max_pair:
-                        new_token_tuple.append(max_pair[0] + max_pair[1]) # 두 bytes를 합쳐 하나로
+                        new_token_tuple.append(max_pair[0] + max_pair[1]) # (b'a', b'b') -> b'ab' 형태로 추가
                         i += 2
                     else:
                         new_token_tuple.append(token_tuple[i])
@@ -159,3 +175,31 @@ def find_chunk_boundaries(
 
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test with a small corpus
+    test_corpus = "Hello world! This is a test corpus for BPE training."
+    
+    # Write to temporary file
+    test_file = "tests/fixtures/tinystories_sample.txt"
+    
+    # Train BPE
+    vocab, merges = train_bpe(
+        input_path=test_file,
+        vocab_size=400,  # 1 special + 256 bytes + 43 merges
+        special_tokens=["<|endoftext|>"]
+    )
+    
+    print(f"\nVocabulary size: {len(vocab)}")
+    print(f"Number of merges: {len(merges)}")
+    
+    # Show first few merges
+    print(f"\nFirst 10 merges:")
+    for i, (b1, b2) in enumerate(merges[:100]):
+        try:
+            char1 = b1.decode('utf-8', errors='replace')
+            char2 = b2.decode('utf-8', errors='replace')
+            print(f"  {i+1:2d}. ({b1}, {b2}) -> '{char1}' + '{char2}'")
+        except:
+            print(f"  {i+1:2d}. {(b1, b2)}")
